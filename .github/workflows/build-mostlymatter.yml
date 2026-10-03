@@ -1,0 +1,147 @@
+name: Build Mostlymatter image
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Upstream Mattermost version without the v, for example 11.11.1
+        required: true
+        default: "11.11.1"
+      source_ref:
+        description: Optional branch or tag of this fork to build instead of v<version>
+        required: false
+        default: ""
+      push:
+        description: Push the image to GHCR
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-mostlymatter
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      VERSION: ${{ inputs.version }}
+      SOURCE_REF: ${{ inputs.source_ref }}
+    steps:
+      - name: Check inputs
+        run: |
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "version must look like 11.11.1" >&2
+            exit 1
+          fi
+          if [ -n "$SOURCE_REF" ] && ! [[ "$SOURCE_REF" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "source_ref has unexpected characters" >&2
+            exit 1
+          fi
+
+      - name: Check out build files
+        uses: actions/checkout@v4
+        with:
+          path: build-files
+          sparse-checkout: deploy/mostlymatter
+
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref || format('v{0}', inputs.version) }}
+          path: src
+
+      - name: Fetch and verify the limitless patch
+        run: |
+          set -euo pipefail
+          name="limitless-v${VERSION}.patch"
+          curl -fsSL "https://framagit.org/framasoft/framateam/mostlymatter/-/raw/v${VERSION}-limitless/limitless.patch" -o "$name"
+          expected=$(awk -v f="$name" '$2 == f { print $1 }' build-files/deploy/mostlymatter/patch-checksums.txt)
+          if [ -z "$expected" ]; then
+            echo "No pinned checksum for $name." >&2
+            echo "Read the patch, then add this line to deploy/mostlymatter/patch-checksums.txt:" >&2
+            sha256sum "$name" >&2
+            exit 1
+          fi
+          echo "$expected  $name" | sha256sum -c -
+
+      - name: Apply the patch
+        run: |
+          set -euo pipefail
+          cd src
+          git apply --check "../limitless-v${VERSION}.patch"
+          git apply "../limitless-v${VERSION}.patch"
+          test -d server/cmd/mostlymatter
+          git status --short | head -30
+
+      - name: Work out build values
+        id: vals
+        run: |
+          set -euo pipefail
+          echo "go=$(awk '/^go /{print $2; exit}' src/server/go.mod)" >> "$GITHUB_OUTPUT"
+          echo "hash=$(git -C src rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/mostlymatter" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build for testing
+        uses: docker/build-push-action@v6
+        with:
+          context: src
+          file: build-files/deploy/mostlymatter/Dockerfile
+          load: true
+          tags: mostlymatter:test
+          build-args: |
+            MM_VERSION=${{ inputs.version }}
+            GO_VERSION=${{ steps.vals.outputs.go }}
+            BUILD_HASH=${{ steps.vals.outputs.hash }}
+            BUILD_NUMBER=${{ inputs.version }}-limitless
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test
+        run: docker run --rm --entrypoint /mattermost/bin/mattermost mostlymatter:test version
+
+      - name: Log in to GHCR
+        if: inputs.push
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push to GHCR
+        if: inputs.push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: src
+          file: build-files/deploy/mostlymatter/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.vals.outputs.image }}:${{ inputs.version }}-limitless
+            ${{ steps.vals.outputs.image }}:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.vals.outputs.hash }}
+            org.opencontainers.image.licenses=AGPL-3.0-only
+            org.opencontainers.image.description=Mattermost ${{ inputs.version }} server with the limitless patch
+          build-args: |
+            MM_VERSION=${{ inputs.version }}
+            GO_VERSION=${{ steps.vals.outputs.go }}
+            BUILD_HASH=${{ steps.vals.outputs.hash }}
+            BUILD_NUMBER=${{ inputs.version }}-limitless
+          cache-from: type=gha
+
+      - name: Summary
+        if: inputs.push
+        run: |
+          {
+            echo "Pushed ${{ steps.vals.outputs.image }}:${{ inputs.version }}-limitless"
+            echo "Digest: ${{ steps.push.outputs.digest }}"
+          } >> "$GITHUB_STEP_SUMMARY"
